@@ -6,15 +6,30 @@
 
 #define BUF_LEN 10240000
 #define MAX_SAMPLE_NUM 102400
+#define MAX_CHUNK_NUM 10240
+#define MAX_STSC_NUM 1024
 
+typedef struct {
+    int first_trunk;
+    int samples_per_trunk;
+    int sample_description_id;
+} stsc_t;
+
+typedef void (*sample_cb_t)(int offset, int len, FILE* fp);
+
+char filename[64];
 char m4a_buf[BUF_LEN];
 int m4a_len;
-int m4a_samples[MAX_SAMPLE_NUM];
-int m4a_sample_num;
 int sample_rate;
 int sample_channel;
-char* es_pos;
-int es_len;
+
+stsc_t stsc_tab[MAX_STSC_NUM];
+int stsc_num;
+int chunk_offset_tab[MAX_CHUNK_NUM];
+int chunk_num;
+int sample_size_tab[MAX_SAMPLE_NUM];
+int sample_num;
+int mdat_len;
 
 void get_adts_head(char head[7], int len)
 {
@@ -39,6 +54,16 @@ void get_adts_head(char head[7], int len)
     head[6]  = 0xfc;
 }
 
+void parse_mdat()
+{
+    char* pos = memmem(m4a_buf, m4a_len, "mdat", 4);
+    if (pos)
+    {
+        mdat_len = htonl(*(int*)(pos - 4)) - 8;
+        printf("mdat len: %d\n", mdat_len);
+    }
+}
+
 void parse_stsd()
 {
     char* pos = memmem(m4a_buf, m4a_len, "stsd", 4);
@@ -55,6 +80,44 @@ void parse_stsd()
         sample_rate = htonl(*(unsigned int*)pos) >> 16;
         printf("sample rate: %d\n", sample_rate);
     } 
+}
+
+void parse_stsc()
+{
+    char* pos = memmem(m4a_buf, m4a_len, "stsc", 4);
+    int i;
+    if (pos)
+    {
+        pos += 8; //number of entry
+        stsc_num = htonl(*(int*)pos);
+        for (i=0; i<stsc_num; i++)
+        {
+            pos += 4; //first chunk
+            stsc_tab[i].first_trunk = htonl(*(int*)pos);
+            pos += 4; //samples per chunk 
+            stsc_tab[i].samples_per_trunk = htonl(*(int*)pos);
+            pos += 4; //sample description ID
+            stsc_tab[i].sample_description_id = htonl(*(int*)pos);
+        }
+        printf("stsc table len: %d\n", stsc_num);
+    }
+}
+
+void parse_stco()
+{
+    char* pos = memmem(m4a_buf, m4a_len, "stco", 4);
+    int i;
+    if (pos)
+    {
+        pos += 8; //number of entry
+        chunk_num = htonl(*(int*)pos);
+        for (i=0; i<chunk_num; i++)
+        {
+            pos += 4; //chunk offset
+            chunk_offset_tab[i] = htonl(*(int*)pos);
+        }
+        printf("chunk num: %d\n", chunk_num);
+    }
 }
 
 void check_m4a_file()
@@ -95,12 +158,108 @@ void parse_stsz()
             for (i=0; i<table_size; i++)
             {
                 pos += 4; //each sample size
-                m4a_samples[i] = htonl(*(int*)pos);
-                //printf("sample %d size: %d\n", i, m4a_samples[i]);
+                sample_size_tab[i] = htonl(*(int*)pos);
+                //printf("sample %d size: %d\n", i, sample_size_tab[i]);
             }
-            m4a_sample_num = i;
+            sample_num = i;
         }
     }
+}
+
+void load_m4a_file(char* name)
+{
+    FILE* fp = fopen(name, "rb");
+    if (fp)
+    {
+        m4a_len = fread(m4a_buf, 1, BUF_LEN, fp);
+        fclose(fp);
+    }
+    strncpy(filename, name, strlen(name) - 4);
+}
+
+void iterate_samples_from_stsc(sample_cb_t sample_cb, FILE* fp)
+{
+    int chunk_index = 0;
+    int sample_index = 0;
+    int i, j, k;
+
+    for (i=0; i<stsc_num; i++) // stsc
+    {
+        int n_chunk;
+        int n_sample;
+        if (i == stsc_num - 1) // last stsc
+            n_chunk = chunk_num - stsc_tab[i].first_trunk + 1;
+        else
+            n_chunk = stsc_tab[i+1].first_trunk - stsc_tab[i].first_trunk;
+        n_sample = stsc_tab[i].samples_per_trunk;
+        for (j=0; j<n_chunk; j++) // chunk
+        {
+            int chunk_offset = chunk_offset_tab[chunk_index++];
+            int sample_size_total = 0;
+            for (k=0; k<n_sample; k++) // sample
+            {
+                int size = sample_size_tab[sample_index];
+                sample_cb(chunk_offset + sample_size_total, size, fp);
+                sample_size_total += size;
+                sample_index++;
+            }
+        }
+    }
+}
+
+void es_cb(int offset, int len, FILE* fp)
+{
+    int ret = fwrite(m4a_buf + offset, 1, len, fp);
+    if (ret != len)
+    {
+        printf("save es error\n");
+    }
+}
+
+void copy_raw_to_es()
+{
+    char name[64];
+    sprintf(name, "%s.es", filename);
+    FILE* fp = fopen(name, "wb");
+    if (!fp)
+        return;
+    iterate_samples_from_stsc(es_cb, fp);
+    fclose(fp);
+    printf("save es successful\n");
+}
+
+void copy_raw_to_latm()
+{
+}
+
+void adts_cb(int offset, int len, FILE* fp)
+{
+    char head[7];
+    int ret;
+
+    get_adts_head(head, len);
+    ret = fwrite(head, 1, 7, fp);
+    if (ret != 7)
+    {
+        printf("save adts head error\n");
+    }    
+    ret = fwrite(m4a_buf + offset, 1, len, fp);
+    if (ret != len)
+    {
+        printf("save adts error\n");
+    }
+}
+
+void copy_raw_to_adts()
+{
+    char name[64];
+    sprintf(name, "%s.adts", filename);
+    FILE* fp = fopen(name, "wb");
+    if (!fp)
+        return;
+    iterate_samples_from_stsc(adts_cb, fp);
+    fclose(fp);
+    printf("save adts successful\n");
 }
 
 int main(int argc, char** argv)
@@ -110,76 +269,18 @@ int main(int argc, char** argv)
         printf("usage: test <file>\n");
         exit(1);
     }
-
-    FILE* fp = fopen(argv[1], "rb");
-    if (fp)
-    {
-        m4a_len = fread(m4a_buf, 1, BUF_LEN, fp);
-        fclose(fp);
-    }
-
-    check_m4a_file();
-
-    es_len = 0;
-    char* pos = memmem(m4a_buf, m4a_len, "mdat", 4);
-    if (pos)
-    {
-        es_pos = pos + 4;
-        es_len = htonl(*(int*)(pos - 4)) - 8;
-        printf("AAC ES len: %d\n", es_len);
-    }
-
-    if (es_len)
-    {
-        FILE* fp_mdat = fopen("aac.es", "wb");
-        if (fp_mdat)
-        {
-            int len = fwrite(es_pos, 1, es_len, fp_mdat);
-            if (len == es_len)
-            {
-                printf("save acc es successful\n");
-            }
-            else
-            {
-                printf("save acc es failed, len=%d expect=%d\n", len, es_len);
-            }
-            fclose(fp_mdat);
-        }
-    }
-
-    parse_stsd();
-    parse_stsz();
     
-	if (m4a_sample_num > 0)
-    {
-        int adts_len = es_len + m4a_sample_num * 7;
-        char* adts_buf = (char*)malloc(adts_len);
-        char* dst_pos = adts_buf;
-        char* src_pos = es_pos;
-        char head[7];
-        int len;
-        for (int i=0; i<m4a_sample_num; i++)
-        {
-            len = m4a_samples[i];
-            get_adts_head(head, len);
-            memcpy(dst_pos, head, 7);
-            memcpy(dst_pos + 7, src_pos, len);
-            dst_pos += (7 + len);
-            src_pos += len;
-        }
-        FILE* fp_adts = fopen("aac.adts", "wb");
-        if (fp_adts)
-        {
-            len = fwrite(adts_buf, 1, adts_len, fp_adts);
-            if (len == adts_len)
-            {
-                printf("save acc adts successful\n");
-            }
-            fclose(fp_adts);
-        }            
-        free(adts_buf);
-    }
-
+    load_m4a_file(argv[1]);
+    check_m4a_file();
+    parse_mdat();
+    parse_stsd();
+    parse_stsc();
+    parse_stsz();
+    parse_stco();
+    copy_raw_to_es();
+    copy_raw_to_latm();
+    copy_raw_to_adts();
+    
     return 0;
 }    
 
