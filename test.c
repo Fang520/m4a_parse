@@ -47,8 +47,8 @@ void get_adts_head(char head[7], int len)
     head[0]  = 0xff;
     head[1]  = 0xf1;
     head[2]  = 0x40 | (unsigned char)(i<<2);
-    //head[3]  = (unsigned char)(sample_channel<<6) | (unsigned char)(((len+7)>>11)&0x3); 
-    head[3]  = (unsigned char)(1<<6) | (unsigned char)(((len+7)>>11)&0x3); 
+    head[3]  = (unsigned char)(sample_channel<<6) | (unsigned char)(((len+7)>>11)&0x3); 
+    //head[3]  = (unsigned char)(1<<6) | (unsigned char)(((len+7)>>11)&0x3); 
     head[4]  = (unsigned char)(((len+7)>>3)&0xff);
     head[5]  = 0x1f | (unsigned char)(((len+7)<<5)&0xe0);
     head[6]  = 0xfc;
